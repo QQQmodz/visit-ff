@@ -1,0 +1,215 @@
+"""
+API Route Definitions
+"""
+import os
+import sys
+import json
+import asyncio
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify
+
+# Add parent directory to path for module imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from api.services import VisitService, TokenService
+from api.account_loader import AccountLoader
+from api.utils import setup_logging
+
+# Setup logging
+logger = setup_logging()
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Initialize services
+visit_service = VisitService()
+token_service = TokenService()
+
+# ==================== ROUTES ====================
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "online",
+        "service": "Free Fire Visit API",
+        "version": "2.0.0",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/visit', methods=['POST'])
+def send_visit():
+    """
+    Send visits to a Free Fire player
+    
+    Request body:
+    {
+        "uid": "123456789",
+        "region": "bd",
+        "count": 100  # optional, default 1000
+    }
+    """
+    try:
+        # Parse request
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON body"}), 400
+
+        uid = data.get('uid')
+        region = data.get('region', '').upper()
+        count = data.get('count', 1000)
+
+        # Validate
+        if not uid:
+            return jsonify({"error": "Missing 'uid' field"}), 400
+        
+        if not region:
+            return jsonify({"error": "Missing 'region' field"}), 400
+
+        try:
+            uid = int(uid)
+        except ValueError:
+            return jsonify({"error": "UID must be a number"}), 400
+
+        if not isinstance(count, int) or count <= 0:
+            return jsonify({"error": "Count must be a positive integer"}), 400
+
+        # Validate region
+        valid_regions = ['BD', 'IND', 'BR', 'US', 'NA', 'SAC']
+        if region not in valid_regions:
+            return jsonify({
+                "error": f"Invalid region. Use: {', '.join(valid_regions)}"
+            }), 400
+
+        # Load accounts for region
+        account_loader = AccountLoader()
+        accounts = account_loader.load_accounts_for_region(region)
+        
+        if not accounts:
+            return jsonify({
+                "error": f"No accounts found for region {region}",
+                "solution": f"Add accounts to accounts/accounts_{region.lower()}.txt"
+            }), 404
+
+        # Get tokens
+        tokens = token_service.get_tokens(region)
+        
+        if not tokens:
+            return jsonify({
+                "error": f"No tokens available for region {region}",
+                "solution": "Run token refresh first"
+            }), 503
+
+        # Send visits
+        result = asyncio.run(visit_service.send_visits(
+            tokens=tokens,
+            uid=uid,
+            region=region,
+            target=count
+        ))
+
+        # Build response
+        response = {
+            "success": True,
+            "uid": str(uid),
+            "region": region,
+            "requested": count,
+            "sent": result.get('success', 0),
+            "failed": result.get('failed', 0),
+            "time": result.get('time', '0s')
+        }
+
+        # Add player info if available
+        if result.get('player_info'):
+            response.update({
+                "player_uid": result['player_info'].get('uid'),
+                "nickname": result['player_info'].get('nickname'),
+                "level": result['player_info'].get('level'),
+                "likes": result['player_info'].get('likes')
+            })
+
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Visit error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/refresh', methods=['POST'])
+def refresh_tokens():
+    """
+    Refresh tokens for a region
+    
+    Request body:
+    {
+        "region": "bd"  # optional, refreshes all if omitted
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        region = data.get('region', '').upper()
+
+        if region:
+            if region not in ['BD', 'IND', 'BR', 'US', 'NA', 'SAC']:
+                return jsonify({"error": f"Invalid region: {region}"}), 400
+            
+            result = token_service.refresh_region(region)
+            return jsonify({
+                "status": "refresh_started",
+                "region": region,
+                "message": "Tokens refreshing in background"
+            })
+        else:
+            # Refresh all regions
+            token_service.refresh_all_regions()
+            return jsonify({
+                "status": "refresh_started",
+                "region": "ALL",
+                "message": "All regions refreshing in background"
+            })
+
+    except Exception as e:
+        logger.error(f"Refresh error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Get system status"""
+    try:
+        status = token_service.get_status()
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Status error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/accounts/<region>', methods=['GET'])
+def get_accounts(region):
+    """Get accounts for a region"""
+    try:
+        region = region.upper()
+        account_loader = AccountLoader()
+        accounts = account_loader.load_accounts_for_region(region)
+        
+        return jsonify({
+            "region": region,
+            "count": len(accounts),
+            "accounts": accounts[:10]  # Return first 10 for preview
+        })
+    except Exception as e:
+        logger.error(f"Accounts error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"error": "Internal server error"}), 500
